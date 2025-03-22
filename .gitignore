@@ -1,3 +1,11 @@
 .vscode/
 bpt/kapathy_videos/gpt/saved_models/
 bpt/vision/data
+.env
+**/__pycache__/**
+**/build/**
+**/dist/**
+**/venv/**
+**/node_modules/**
+**/build_from_scratch/build_from_scratch.ipynb
+**/build_from_scratch/build_from_scratch.ipynb

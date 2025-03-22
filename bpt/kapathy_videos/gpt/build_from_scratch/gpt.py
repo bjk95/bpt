@@ -4,18 +4,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from time import time
+from torch.amp import autocast, GradScaler
 
-batch_size = 64
+# T4-optimized hyperparameters
+use_mixed_precision = True  # Set to False to disable mixed precision training
+batch_size = 256  # Use standard batch size without accumulation
 context_size = 256
-max_iterations = 3000
+max_iterations = 192000 // batch_size
 learning_rate = 1e-3
 device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
 print(f'{device=}')
-evaluation_iterations = 500
+evaluation_iterations = 50
 n_embedding_dimensions = 384
 n_blocks = 6
 n_heads = 6
 dropout = .2
+
+print(f'Hyperparameters: {batch_size=} {context_size=} {max_iterations=} {learning_rate=} {use_mixed_precision=}')
+
+if device == 'cuda':
+    torch.set_default_device('cuda')
+    # Set memory allocation to be more efficient on T4
+    torch.backends.cudnn.benchmark = True  # Optimize CUDNN for fixed input sizes
+
+
 
 torch.manual_seed(1337)
 
@@ -95,6 +107,7 @@ class NanoGPT(nn.Module):
         positional_embedding = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
         x= token_embeddings + positional_embedding
         x = self.blocks(x)
+        x = self.final_layer_norm(x)  # Apply final layer norm before language head
         logits = self.language_modelling_head(x) # (B, T, vocab_size)
         if targets is None:
             loss = None
@@ -107,15 +120,32 @@ class NanoGPT(nn.Module):
 
     
     def generate(self, indices: torch.Tensor, max_new_tokens: int):
-        for _ in range(max_new_tokens):
-            idx_cond = indices[:, -context_size:]
-            logits, _ = self(idx_cond)
-            # extract last time step
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=1)
-            next_index = torch.multinomial(probs,num_samples=1)
-            indices = torch.cat((indices, next_index), dim=1)
-            
+        # Set to evaluation mode for generation
+        self.eval()
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                # Take only the last context_size tokens
+                idx_cond = indices[:, -context_size:]
+                
+                if use_mixed_precision:
+                    # Use inference mode with autocast if mixed precision is enabled
+                    with autocast(device_type=device):
+                        logits, _ = self(idx_cond)
+                        # extract last time step
+                        logits = logits[:, -1, :]
+                        probs = F.softmax(logits, dim=1)
+                        next_index = torch.multinomial(probs, num_samples=1)
+                else:
+                    # Standard precision inference
+                    logits, _ = self(idx_cond)
+                    logits = logits[:, -1, :]
+                    probs = F.softmax(logits, dim=1)
+                    next_index = torch.multinomial(probs, num_samples=1)
+                
+                indices = torch.cat((indices, next_index), dim=1)
+                
+        # Remember to set back to training mode if continuing training
+        self.train()
         return indices
       
 def load_data() -> tuple[Tensor, Tensor, int, dict[str, int], dict[int, str], Callable[[list[int]], str], list[str]]:
@@ -150,29 +180,52 @@ def estimate_loss(model: nn.Module, training_data: torch.Tensor, validation_data
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(evaluation_iterations)
+        losses = torch.zeros(evaluation_iterations, device=device)
         for k in range(evaluation_iterations):
             X, Y = get_batch(split, training_data, validation_data)
-            _, loss = model(X,Y)
+            if use_mixed_precision:
+                with autocast(device_type=device):  # Use mixed precision for evaluation too
+                    _, loss = model(X,Y)
+            else:
+                _, loss = model(X,Y)
             losses[k] = loss.item()
         out[split] = losses.mean().item()
     model.train()
     return out
 
 def train(model, get_batch, decode, characters, stoi, itos, max_iterations, training_data, validation_data):
+    print(f'{max_iterations=}')
     start = time()
     block_start_time = time()
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    scaler = GradScaler() if use_mixed_precision else None  # Only create scaler if using mixed precision
 
     for steps in range(max_iterations):
         X_batch, Y_batch = get_batch('train', training_data, validation_data)
         
-        _, loss = model(X_batch, Y_batch)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        
+        if use_mixed_precision:
+            # Mixed precision forward pass
+            with autocast(device_type=device):
+                _, loss = model(X_batch, Y_batch)
+            
+            # Scale gradients and perform backward pass
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # Standard precision training
+            _, loss = model(X_batch, Y_batch)
+            loss.backward()
+            optimizer.step()
+        
+        if steps % 10 == 0:
+            print(f'{steps=}')
         
         if steps % 100 == 0:
+            # if False:
+            print('Estimating loss')
             current_loss = estimate_loss(model, training_data, validation_data)
             print(f'{steps=} {current_loss=}')
             print(f'{time() - block_start_time:.1f} seconds')
@@ -188,8 +241,12 @@ def train(model, get_batch, decode, characters, stoi, itos, max_iterations, trai
                 'stoi': stoi,
                 'itos': itos
             }
-            torch.save(checkpoint, f'saved_models/checkpoint_step_{steps}.pth')
             
+            # Save scaler state only if using mixed precision
+            if use_mixed_precision:
+                checkpoint['scaler'] = scaler.state_dict()
+                
+            torch.save(checkpoint, f'saved_models/checkpoint_step_{steps}.pth')
 
     context = torch.zeros((1,1), dtype=torch.long, device=device)
     print(decode(model.generate(context, max_new_tokens=400)[0].tolist()))
@@ -202,6 +259,11 @@ def run():
     training_data, validation_data, vocabulary_size, stoi, itos, decode, characters = load_data()
     
     model = NanoGPT(vocabulary_size)
+    
+    # Calculate and print model size
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"Model has {param_count:,} parameters")
+    
     m = model.to(device)   
     train(m, get_batch, decode, characters, stoi, itos, max_iterations, training_data, validation_data)
     
