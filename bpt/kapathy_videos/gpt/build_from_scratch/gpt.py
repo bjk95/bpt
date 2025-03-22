@@ -1,12 +1,14 @@
+from typing import Callable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from time import time
+
 batch_size = 64
 context_size = 256
-max_iterations = 5000
-learning_rate = 3e-4
+max_iterations = 3000
+learning_rate = 1e-3
 device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
 print(f'{device=}')
 evaluation_iterations = 500
@@ -14,31 +16,8 @@ n_embedding_dimensions = 384
 n_blocks = 6
 n_heads = 6
 dropout = .2
+
 torch.manual_seed(1337)
-
-with open('input.txt', 'r', encoding='utf8') as f:
-    text = f.read()
-
-characters = sorted(list(set(text)))
-vocabulary_size = len(characters)  
-
-stoi = {ch: i for i, ch in enumerate(characters)}
-itos = {i: ch for ch, i in stoi.items()}
-
-encode = lambda s: [stoi[c] for c in s]
-decode = lambda l: ''.join([itos[i] for i in l])
-
-data = torch.tensor(encode(text), dtype=torch.long)
-n_split = int(len(data) *.9)
-training_data = data[:n_split]
-validation_data = data[n_split:]
-
-def get_batch(split:str = 'train') -> tuple[torch.Tensor, torch.Tensor]:
-    data = training_data if split == 'train' else validation_data
-    idx = torch.randint(len(data) - context_size, (batch_size,))
-    x = torch.stack([data[i:i+context_size] for i in idx]).to(device)
-    y = torch.stack([data[i+1:i+context_size+1] for i in idx]).to(device)
-    return x, y
 
 class Head(nn.Module):
     def __init__(self, head_size: int) -> None:
@@ -50,7 +29,7 @@ class Head(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self,x: torch.Tensor):
-        B,T,C = x.shape
+        _,T,C = x.shape
         k: Tensor = self.key(x)
         q: Tensor = self.query(x)
         affinity_weights: Tensor = q @ k.transpose(-2,-1) * C**-.5
@@ -100,9 +79,9 @@ class Block(nn.Module):
         
         return x
     
-      
-class BigramLanguageModel(nn.Module):
-    def __init__(self,) -> None:
+    
+class NanoGPT(nn.Module):
+    def __init__(self, vocabulary_size: int) -> None:
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocabulary_size, n_embedding_dimensions)
         self.position_embedding_table = nn.Embedding(context_size, n_embedding_dimensions)
@@ -111,7 +90,7 @@ class BigramLanguageModel(nn.Module):
         self.language_modelling_head = nn.Linear(n_embedding_dimensions, vocabulary_size)
         
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
-        B, T = idx.shape
+        _, T = idx.shape
         token_embeddings = self.token_embedding_table(idx) # (B, T, embedding_dimensions)
         positional_embedding = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
         x= token_embeddings + positional_embedding
@@ -130,7 +109,7 @@ class BigramLanguageModel(nn.Module):
     def generate(self, indices: torch.Tensor, max_new_tokens: int):
         for _ in range(max_new_tokens):
             idx_cond = indices[:, -context_size:]
-            logits, loss = self(idx_cond)
+            logits, _ = self(idx_cond)
             # extract last time step
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=1)
@@ -138,56 +117,94 @@ class BigramLanguageModel(nn.Module):
             indices = torch.cat((indices, next_index), dim=1)
             
         return indices
+      
+def load_data() -> tuple[Tensor, Tensor, int, dict[str, int], dict[int, str], Callable[[list[int]], str], list[str]]:
+    with open('input.txt', 'r', encoding='utf8') as f:
+        text = f.read()
+
+    characters = sorted(list(set(text)))
+    vocabulary_size = len(characters)  
+
+    stoi = {ch: i for i, ch in enumerate(characters)}
+    itos = {i: ch for ch, i in stoi.items()}
     
-model = BigramLanguageModel()
-m = model.to(device)
+    encode: Callable[[str], list[int]] = lambda s: [stoi[c] for c in s]
+    decode: Callable[[list[int]], str] = lambda l: ''.join([itos[i] for i in l])
+    
+    data = torch.tensor(encode(text), dtype=torch.long)
+    n_split = int(len(data) *.9)
+    training_data = data[:n_split]
+    validation_data = data[n_split:]
+    
+    return training_data, validation_data, vocabulary_size, stoi, itos, decode, characters
+
+def get_batch(split:str | None, training_data: torch.Tensor, validation_data: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    data = training_data if split == 'train' or None else validation_data
+    idx = torch.randint(len(data) - context_size, (batch_size,))
+    x = torch.stack([data[i:i+context_size] for i in idx]).to(device)
+    y = torch.stack([data[i+1:i+context_size+1] for i in idx]).to(device)
+    return x, y
 
 @torch.no_grad()
-def estimate_loss():
+def estimate_loss(model: nn.Module, training_data: torch.Tensor, validation_data: torch.Tensor) -> dict[str, float]:
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(evaluation_iterations)
         for k in range(evaluation_iterations):
-            X, Y = get_batch(split)
-            logits, loss = model(X,Y)
+            X, Y = get_batch(split, training_data, validation_data)
+            _, loss = model(X,Y)
             losses[k] = loss.item()
-        out[split] = losses.mean()
+        out[split] = losses.mean().item()
     model.train()
     return out
 
-optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
+def train(model, get_batch, decode, characters, stoi, itos, max_iterations, training_data, validation_data):
+    start = time()
+    block_start_time = time()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-start = time()
-block_start_time = time()
-for steps in range(max_iterations):
-    X_batch, Y_batch = get_batch('train')
-    
-    logits, loss = m(X_batch, Y_batch)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
-    
-    if steps % 100 == 0:
-        current_loss = estimate_loss()
-        print(f'{steps=} {current_loss=}')
-        print(f'{time() - block_start_time:.1f} seconds')
-        block_start_time = time()
+    for steps in range(max_iterations):
+        X_batch, Y_batch = get_batch('train', training_data, validation_data)
         
+        _, loss = model(X_batch, Y_batch)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
         
-        checkpoint = {
-            'model_state_dict': m.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'step': steps,
-            'loss': current_loss,
-            'characters': characters,
-            'stoi': stoi,
-            'itos': itos
-        }
-        torch.save(checkpoint, f'saved_models/checkpoint_step_{steps}.pth')
+        if steps % 100 == 0:
+            current_loss = estimate_loss(model, training_data, validation_data)
+            print(f'{steps=} {current_loss=}')
+            print(f'{time() - block_start_time:.1f} seconds')
+            block_start_time = time()
+            
+            
+            checkpoint = {
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'step': steps,
+                'loss': current_loss,
+                'characters': characters,
+                'stoi': stoi,
+                'itos': itos
+            }
+            torch.save(checkpoint, f'saved_models/checkpoint_step_{steps}.pth')
+            
 
-context = torch.zeros((1,1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=400)[0].tolist()))
-print(f'Took {time() - start:.1f} seconds')
-torch.save(m.state_dict(), 'saved_models/gpt_model.pth')
-print("Model saved to gpt_model.pth")
+    context = torch.zeros((1,1), dtype=torch.long, device=device)
+    print(decode(model.generate(context, max_new_tokens=400)[0].tolist()))
+    print(f'Took {time() - start:.1f} seconds')
+    torch.save(model.state_dict(), 'saved_models/gpt_model.pth')
+    print("Model saved to gpt_model.pth")
+
+
+def run():
+    training_data, validation_data, vocabulary_size, stoi, itos, decode, characters = load_data()
+    
+    model = NanoGPT(vocabulary_size)
+    m = model.to(device)   
+    train(m, get_batch, decode, characters, stoi, itos, max_iterations, training_data, validation_data)
+    
+if __name__ == '__main__':
+    run()
+    
