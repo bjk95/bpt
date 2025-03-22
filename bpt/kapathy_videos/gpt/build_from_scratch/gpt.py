@@ -5,6 +5,10 @@ import torch.nn.functional as F
 from torch import Tensor
 from time import time
 from torch.amp import autocast, GradScaler
+import wandb
+from torch.utils.tensorboard import SummaryWriter
+import os
+import types
 
 # T4-optimized hyperparameters
 use_mixed_precision = True  # Set to False to disable mixed precision training
@@ -22,12 +26,43 @@ dropout = .2
 
 print(f'Hyperparameters: {batch_size=} {context_size=} {max_iterations=} {learning_rate=} {use_mixed_precision=}')
 
+# Make wandb optional
+use_wandb = True  # Set to True if you want to use wandb
+use_tensorboard = True  # Set to True if you want to use TensorBoard
+tensorboard_log_dir = 'runs/gpt'
+
+# Create TensorBoard log directory if it doesn't exist
+if use_tensorboard:
+    os.makedirs(tensorboard_log_dir, exist_ok=True)
+
+if use_wandb:
+    run = wandb.init(
+        # Set the wandb entity where your project will be logged (your username)
+        entity="bjk95-just-me",  # Changed from "brad" to "bjk95" based on your login
+        # Set the wandb project where this run will be logged.
+        project="bpt",
+        # Track hyperparameters and run metadata.
+        config={
+            "learning_rate": learning_rate,
+            "architecture": "NanoGPT",
+            "dataset": "input.txt",
+            "max_iterations": max_iterations,
+            "batch_size": batch_size,
+            "context_size": context_size,
+            "n_blocks": n_blocks,
+            "n_heads": n_heads,
+            "dropout": dropout,
+            "use_mixed_precision": use_mixed_precision,
+        },
+    )
+else:
+    # Avoid type error by not defining run at all for the None case
+    pass
+
 if device == 'cuda':
     torch.set_default_device('cuda')
     # Set memory allocation to be more efficient on T4
     torch.backends.cudnn.benchmark = True  # Optimize CUDNN for fixed input sizes
-
-
 
 torch.manual_seed(1337)
 
@@ -199,6 +234,67 @@ def train(model, get_batch, decode, characters, stoi, itos, max_iterations, trai
     block_start_time = time()
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     scaler = GradScaler() if use_mixed_precision else None  # Only create scaler if using mixed precision
+    
+    # Initialize TensorBoard writer if enabled
+    writer = SummaryWriter(tensorboard_log_dir) if use_tensorboard else None
+    
+    # Add model graph to TensorBoard
+    if use_tensorboard and writer is not None:
+        # Create a wrapper model for visualization that doesn't modify the original model
+        viz_model = TensorBoardModelWrapper(model)
+        
+        # Create a small batch for tracing
+        sample_input = torch.zeros((1, context_size), dtype=torch.long, device=device)
+        
+        # Add graph using the visualization wrapper
+        try:
+            writer.add_graph(viz_model, sample_input)
+        except Exception as e:
+            print(f"Warning: Could not add model graph to TensorBoard: {e}")
+            # Continue with training despite the graph error
+    
+    # Setup activation hooks for monitoring layer outputs
+    activation_hooks = []
+    if use_tensorboard and writer is not None:
+        # Register hooks on key layers to capture activations during forward pass
+        def get_activation_hook(name):
+            def hook(module, input, output):
+                # Only log activations periodically to save space and compute
+                if steps % 100 == 0:
+                    if isinstance(output, tuple):
+                        output = output[0]  # Take first element if it's a tuple
+                    
+                    # For 3D tensors (batch, sequence, features)
+                    if len(output.shape) == 3:
+                        # Plot histograms of activations
+                        writer.add_histogram(f'activations/{name}', output.detach(), steps)
+                        
+                        # Plot mean activation across sequence dimension
+                        mean_activation = output.detach().mean(dim=1)
+                        writer.add_histogram(f'activations/{name}_mean', mean_activation, steps)
+                        
+                        # Log the first few examples for visualization
+                        if output.shape[0] > 0:  # Ensure we have at least one example
+                            # First example, visualize heatmap of sequence x features
+                            writer.add_image(f'activations/{name}_heatmap', 
+                                           output[0].unsqueeze(0).detach().cpu().numpy(), 
+                                           steps, 
+                                           dataformats='CHW')
+            return hook
+        
+        # Attach hooks to various layers
+        activation_hooks.append(model.token_embedding_table.register_forward_hook(
+            get_activation_hook('token_embeddings')))
+        activation_hooks.append(model.blocks[0].self_attention.register_forward_hook(
+            get_activation_hook('first_block_attention')))
+        activation_hooks.append(model.blocks[-1].self_attention.register_forward_hook(
+            get_activation_hook('last_block_attention')))
+        activation_hooks.append(model.blocks[0].feed_forward.register_forward_hook(
+            get_activation_hook('first_block_ffn')))
+        activation_hooks.append(model.blocks[-1].feed_forward.register_forward_hook(
+            get_activation_hook('last_block_ffn')))
+        activation_hooks.append(model.final_layer_norm.register_forward_hook(
+            get_activation_hook('final_layer_norm')))
 
     for steps in range(max_iterations):
         X_batch, Y_batch = get_batch('train', training_data, validation_data)
@@ -220,6 +316,10 @@ def train(model, get_batch, decode, characters, stoi, itos, max_iterations, trai
             loss.backward()
             optimizer.step()
         
+        # Log training loss to TensorBoard at each step
+        if use_tensorboard and writer is not None:
+            writer.add_scalar('training_loss', loss.item(), steps)
+        
         if steps % 10 == 0:
             print(f'{steps=}')
         
@@ -231,6 +331,18 @@ def train(model, get_batch, decode, characters, stoi, itos, max_iterations, trai
             print(f'{time() - block_start_time:.1f} seconds')
             block_start_time = time()
             
+            # Log validation metrics to TensorBoard
+            if use_tensorboard and writer is not None:
+                writer.add_scalars('loss', {
+                    'train': current_loss['train'],
+                    'val': current_loss['val']
+                }, steps)
+            
+            if use_wandb and 'run' in globals():
+                run.log({
+                    'loss': current_loss,
+                    'step': steps,
+                })
             
             checkpoint = {
                 'model_state_dict': model.state_dict(),
@@ -254,8 +366,29 @@ def train(model, get_batch, decode, characters, stoi, itos, max_iterations, trai
     torch.save(model.state_dict(), 'saved_models/gpt_model.pth')
     print("Model saved to gpt_model.pth")
 
+    # Clean up activation hooks to prevent memory leaks
+    for hook in activation_hooks:
+        hook.remove()
 
-def run():
+    # Close TensorBoard writer
+    if use_tensorboard and writer is not None:
+        writer.close()
+
+    if use_wandb and 'run' in globals():
+        run.finish()
+
+# Add a TensorBoardModelWrapper class for visualization purposes
+class TensorBoardModelWrapper(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        
+    def forward(self, x):
+        # Only return the logits for TensorBoard visualization
+        logits, _ = self.model(x)
+        return logits
+
+def run_model_training():
     training_data, validation_data, vocabulary_size, stoi, itos, decode, characters = load_data()
     
     model = NanoGPT(vocabulary_size)
@@ -268,5 +401,5 @@ def run():
     train(m, get_batch, decode, characters, stoi, itos, max_iterations, training_data, validation_data)
     
 if __name__ == '__main__':
-    run()
+    run_model_training()
     
