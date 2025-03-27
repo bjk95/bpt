@@ -35,7 +35,7 @@ git config --global user.email "$GIT_EMAIL"
 echo "===== Generating SSH key for Git ====="
 ssh-keygen -t ed25519 -C "$GIT_EMAIL" -f ~/.ssh/id_ed25519 -N ""
 eval "$(ssh-agent -s)"
-ssh-add ~/.ssh/id_ed25519
+ssh-add ~/.ssh/google_compute_engine
 
 # Display the public key to add to GitHub/GitLab
 echo "===== Add this SSH key to your GitHub/GitLab account ====="
