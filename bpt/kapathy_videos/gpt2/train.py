@@ -1,3 +1,4 @@
+import numpy as np
 from dataclasses import dataclass
 import inspect
 import math
@@ -9,7 +10,8 @@ from torch.nn import functional as F
 from transformers import GPT2LMHeadModel
 import tiktoken
 from torch.distributed import init_process_group, destroy_process_group
-
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
 
 @dataclass
@@ -190,30 +192,46 @@ class GPT(nn.Module):
         return optimizer
 
 
+def load_tokens(filename:str):
+    npt = np.load(filename)
+    return torch.tensor(npt, dtype=torch.long)
+
 class DataLoaderLite:
-    def __init__(self, B: int, T: int) -> None:
+    def __init__(self, B: int, T: int, process_rank: int, num_processes: int, split: str) -> None:
         self.B = B
         self.T = T
-        with open('../gpt/input.txt') as f:
-            text = f.read()
-            
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens).to(device)
-        print(f'loaded {len(self.tokens)} tokens')
-        print(f'1 epoch =  {len(self.tokens) // (B*T)} batches')
-        self.current_position = 0
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
-    def next_batch(self) -> tuple[Tensor, Tensor]:
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if is_master_process:
+            print(f"found {len(shards)} shards for split {split}")
+        self.reset()
+
+    def reset(self):
+        # state, init at shard zero
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
+
+    def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        
-        x = (buf[:-1].view(B,T))
-        y = (buf[1:].view(B,T))
-        self.current_position+=B*T
-        if self.current_position + (B*T+1) > len(self.tokens):
-            self.current_position = 0
-            
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the position in the tensor
+        self.current_position += B * T * self.num_processes
+        # if loading the next batch would be out of bounds, advance to next shard
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = B * T * self.process_rank
         return x, y
 
 if __name__ == '__main__':     
@@ -238,25 +256,28 @@ if __name__ == '__main__':
     torch.cuda.manual_seed(1337)
     torch.mps.manual_seed(1337)
     total_batch_size = 524288
-    B = 16
+    B = 8
     T = 1024
     assert total_batch_size % (B*T * ddp_world_size) ==0
     grad_accumulation_steps = total_batch_size // (B*T * ddp_world_size)
     print(f'grad_accumulation_steps: {grad_accumulation_steps}')
     print(f'total_batch_size: {total_batch_size}')
     torch.set_float32_matmul_precision('medium')
-    train_loader = DataLoaderLite(16, 1024)
+    train_loader = DataLoaderLite(B, T, process_rank=ddp_rank, num_processes=ddp_world_size, split='train')
     # model = GPT.from_pretrained('gpt2')
     model = GPT(GPTConfig())
     model.eval()
     model.to(device)
     model = torch.compile(model) # type: ignore
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module if ddp else model
     # logits, loss= m del(x, y)
     # print(f'{logits.shape=}, {loss=}')
     max_lr = 6e-4
     min_lr = max_lr*.1
     warmup_steps = 10
-    max_steps = 50
+    max_steps = 250
     def get_lr(step: int) -> float:
         if step < warmup_steps:
             return max_lr * (step+1) / warmup_steps
@@ -268,21 +289,24 @@ if __name__ == '__main__':
             coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio))
             return max_lr + coeff * (max_lr - min_lr)
     learning_rate = 3e-4
-    optimiser = model.configure_optimizers(weight_decay=.1, learning_rate=6e-4, device=device)
+    optimiser = raw_model.configure_optimizers(weight_decay=.1, learning_rate=6e-4, device=device)
 
     for step in range(max_steps):
 
         t0= time.time()
         optimiser.zero_grad()
         loss_accum = 0
-        for i in range(grad_accumulation_steps):
+        for micro_step in range(grad_accumulation_steps):
             x, y = train_loader.next_batch()
             with torch.autocast(device):
                 logits, loss= model(x, y)
-                loss = loss / grad_accumulation_steps
-                loss_accum += loss.detach()
-                # import code; code.interact(local=locals())
+            loss = loss / grad_accumulation_steps
+            loss_accum += loss.detach()
+            if ddp:
+                model.require_backward_grad_sync = (micro_step == grad_accumulation_steps-1)
             loss.backward()
+        if ddp:
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         lr = get_lr(step)
         for param_group in optimiser.param_groups:
@@ -292,7 +316,8 @@ if __name__ == '__main__':
         t1 = time.time()
         dt = (t1-t0)*1000
         tokens_per_second = (train_loader.B * train_loader.T * grad_accumulation_steps) / (t1-t0)
-        print(f'step {step}, loss: {loss_accum}, dt: {dt}ms, tokens/s = {tokens_per_second} {norm=}, {lr=}')
+        if is_master_process:
+            print(f'step {step}, loss: {loss_accum}, dt: {dt}ms, tokens/s = {tokens_per_second} {norm=}, {lr=}')
 
     max_return_sequences = 2
     max_length =30
