@@ -1,5 +1,7 @@
 .vscode/
 bpt/kapathy_videos/gpt/saved_models/
+bpt/kapathy_videos/gpt2/edu_fineweb10B/
+bpt/kapathy_videos/gpt2/log/
 bpt/kapathy_videos/gpt/runs/
 bpt/kapathy_videos/gpt/wandb/
 bpt/chess/data
