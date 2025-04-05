@@ -11,10 +11,10 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
-def get_lr(step: int) -> float:
+def get_lr(step: int, max_steps: int) -> float:
     max_lr = 6e-4
     min_lr = max_lr*.1
-    warmup_steps = 10
+    warmup_steps = 715
 
     if step < warmup_steps:
         return max_lr * (step+1) / warmup_steps
@@ -83,6 +83,8 @@ if __name__ == '__main__':
 
     torch.set_float32_matmul_precision('medium')
     train_loader = DataLoaderLite(B, T, process_rank=ddp_rank, num_processes=ddp_world_size, is_master_process=is_master_process, split='train')
+    val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, is_master_process=is_master_process,split="val")
+
     # model = GPT.from_pretrained('gpt2')
     model = GPT(GPTConfig())
     model.eval()
@@ -91,13 +93,19 @@ if __name__ == '__main__':
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model
-    max_steps = 250
-    
+    max_steps = 19073
+    device_type = "cuda" if device.startswith("cuda") else "cpu"
+    log_dir = "log"
+    os.makedirs(log_dir, exist_ok=True)
     optimiser = raw_model.configure_optimizers(weight_decay=.1, learning_rate=6e-4, device=device)
-
+    log_file = os.path.join(log_dir, f"log.txt")
+    with open(log_file, "w") as f: # open for writing to clear the file
+        pass
     for step in range(max_steps):
         t0= time.time()
         optimiser.zero_grad()
+        last_step = (step == max_steps - 1)
+
         loss_accum = 0
         for micro_step in range(grad_accumulation_steps):
             x, y = train_loader.next_batch()
@@ -108,10 +116,41 @@ if __name__ == '__main__':
             if ddp:
                 model.require_backward_grad_sync = (micro_step == grad_accumulation_steps-1)
             loss.backward()
-        if ddp:
-            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+        # once in a while evaluate our validation loss
+        if step % 250 == 0 or last_step:
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():
+                val_loss_accum = 0.0
+                val_loss_steps = 20
+                for _ in range(val_loss_steps):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                        logits, loss = model(x, y)
+                    loss = loss / val_loss_steps
+                    val_loss_accum += loss.detach()
+            if ddp:
+                dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+            if is_master_process:
+                print(f"validation loss: {val_loss_accum.item():.4f}")
+                with open(log_file, "a") as f:
+                    f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+                if step > 0 and (step % 5000 == 0 or last_step):
+                    # optionally write model checkpoints
+                    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'config': raw_model.config,
+                        'step': step,
+                        'val_loss': val_loss_accum.item()
+                    }
+                    # you might also want to add optimizer.state_dict() and
+                    # rng seeds etc., if you wanted to more exactly resume training
+                    torch.save(checkpoint, checkpoint_path)
+        
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        lr = get_lr(step)
+        lr = get_lr(step, max_steps)
         for param_group in optimiser.param_groups:
             param_group['lr'] = lr
         optimiser.step()
