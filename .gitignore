@@ -6,6 +6,7 @@ bpt/kapathy_videos/gpt/runs/
 bpt/kapathy_videos/gpt/wandb/
 bpt/chess/data
 bpt/vision/data
+wandb/
 .env
 **/__pycache__/**
 **/build/**

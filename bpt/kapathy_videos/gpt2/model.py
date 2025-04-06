@@ -8,6 +8,16 @@ from transformers import GPT2LMHeadModel
 device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
 
 @dataclass
+class RunConfig:
+    max_learning_rate: float = 6e-4
+    minimum_learning_rate: float = 6e-4 * 1
+    warmup_steps: int = 715
+    total_batch_size: int = 524288 
+    max_steps: int = 19073
+    batch_size = 8
+    seed: int = 1337
+
+@dataclass
 class GPTConfig:
     context_length: int = 1024
     vocab_size: int = 50257
