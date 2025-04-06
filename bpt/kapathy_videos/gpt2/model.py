@@ -10,11 +10,11 @@ device = torch.accelerator.current_accelerator().type if torch.accelerator.is_av
 @dataclass
 class RunConfig:
     max_learning_rate: float = 6e-4
-    minimum_learning_rate: float = 6e-4 * 1
+    minimum_learning_rate: float = 6e-4 * .1
     warmup_steps: int = 715
     total_batch_size: int = 524288 
     max_steps: int = 19073
-    batch_size = 8
+    batch_size = 64
     seed: int = 1337
 
 @dataclass
@@ -99,6 +99,8 @@ class GPT(nn.Module):
         
         self.lm_head = nn.Linear(config.n_embedding_dimensions, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight # type: ignore
+        
+        self.apply(self._init_weights)
     def _init_weights(self, module: Tensor):
         std = 0.02
         if hasattr(module, 'BPT_SCALE_INIT'):

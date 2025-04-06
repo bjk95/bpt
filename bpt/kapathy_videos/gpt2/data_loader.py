@@ -13,7 +13,7 @@ class DataLoaderLite:
         self.process_rank = process_rank
         self.num_processes = num_processes
 
-        data_root = "edu_fineweb10B"
+        data_root = "bpt/kapathy_videos/gpt2/edu_fineweb10B"
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s]
         shards = sorted(shards)

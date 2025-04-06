@@ -30,7 +30,7 @@ def sample(model: GPT, prefix: str):
     max_length =30
     enc = tiktoken.get_encoding('gpt2')
     t = enc.encode(prefix)
-    tokens: Tensor = torch.tensor(t, dtype=torch.long)
+    tokens: Tensor = torch.tensor(t, dtype=torch.long, device=device)
     tokens = tokens.unsqueeze(0).repeat(max_return_sequences, 1) # (5,8)
     x = tokens.to(device)
 
@@ -103,13 +103,14 @@ if __name__ == '__main__':
         pass
     for step in range(run_config.max_steps):
         t0= time.time()
+        model.train()
         optimiser.zero_grad()
         last_step = (step == run_config.max_steps - 1)
 
-        loss_accumulator = torch.tensor(0.0)
+        loss_accumulator = torch.tensor(0.0, device=device)
         for micro_step in range(grad_accumulation_steps):
             x, y = train_loader.next_batch()
-            with torch.autocast(device):
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                 logits, loss= model(x, y)
             loss = loss / grad_accumulation_steps
             loss_accumulator += loss.detach()
@@ -121,7 +122,7 @@ if __name__ == '__main__':
             model.eval()
             val_loader.reset()
             with torch.no_grad():
-                val_loss_accumulator = torch.tensor(0.0)
+                val_loss_accumulator = torch.tensor(0.0, device=device)
                 val_loss_steps = 20
                 for _ in range(val_loss_steps):
                     x, y = val_loader.next_batch()
@@ -179,3 +180,5 @@ if __name__ == '__main__':
     wandb.finish() 
     if ddp: 
         destroy_process_group()
+
+# run using:  torchrun --standalone --nproc_per_node=1 -m bpt.kapathy_videos.gpt2.train
