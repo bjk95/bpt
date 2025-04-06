@@ -8,6 +8,7 @@ bpt/kapathy_videos/gpt/wandb/
 bpt/chess/data
 bpt/vision/data
 wandb/
+post_training/llama-finetuned/runs/
 .env
 **/__pycache__/**
 **/build/**
